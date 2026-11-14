@@ -21,7 +21,7 @@ param([string]$Json = '', [switch]$Yes)
     $ProgressPreference = 'SilentlyContinue'
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
 
-    $version = '1.0.0'
+    $version = '1.1.0'
     $site = if ($env:PXDR_SITE) { $env:PXDR_SITE.TrimEnd('/') } else { 'https://pxdtek.com' }
 
     function Say([string]$Text, [string]$Color = 'Gray') { Write-Host $Text -ForegroundColor $Color }
@@ -145,7 +145,7 @@ param([string]$Json = '', [switch]$Yes)
     $sections = New-Object System.Collections.Generic.List[object]
     function Add-Problem([string]$Level, [string]$Text) { $problems.Add([ordered]@{ level = $Level; text = $Text }) }
     function New-Section([string]$Title) {
-        $s = [ordered]@{ title = $Title; rows = (New-Object System.Collections.Generic.List[object]); lines = (New-Object System.Collections.Generic.List[string]); note = '' }
+        $s = [ordered]@{ title = $Title; rows = (New-Object System.Collections.Generic.List[object]); lines = (New-Object System.Collections.Generic.List[string]); note = ''; chart = $null }
         $sections.Add($s); $s
     }
     function Add-Row($Section, [string]$Key, $Value, [string]$Flag = '') {
@@ -196,6 +196,7 @@ param([string]$Json = '', [switch]$Yes)
         }
     }
     $report.by = if ($isSystem) { 'SYSTEM' } else { $me.Name }
+    $rel = @{ Metrics = $null; Records = $null }   # Reliability Monitor's data, read once (Read-ReliabilityData)
 
     # ---- this PC ---------------------------------------------------------------------------------------------------
     function Read-PC {
@@ -335,9 +336,17 @@ param([string]$Json = '', [switch]$Yes)
             Add-Row $s 'Disk errors' "$($disk.Count) in the last 30 days" 'warn'
         }
 
-        # programs that crashed this week
-        $apps = Get-Events @{ LogName = 'Application'; ProviderName = 'Application Error'; Id = 1000; StartTime = (Get-Date).AddDays(-7) } 200
-        if ($apps.Count) {
+        # programs that crashed this week: Reliability Monitor's own list when Windows keeps one, else the event log
+        if ($rel.Records) {
+            $week = @($rel.Records | Where-Object { $_.TimeGenerated -gt (Get-Date).AddDays(-7) -and ($_.SourceName -eq 'Application Error' -or $_.SourceName -eq 'Application Hang') })
+            if ($week.Count) {
+                $top = $week | ForEach-Object { if ($_.ProductName) { $_.ProductName } else { 'unknown' } } | Group-Object | Sort-Object Count -Descending | Select-Object -First 6
+                Add-Row $s 'Program crashes' ("$($week.Count) this week: " + (($top | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', '))
+            } else { Add-Row $s 'Program crashes' 'none this week' 'ok' }
+            $apps = $null
+        } else { $apps = Get-Events @{ LogName = 'Application'; ProviderName = 'Application Error'; Id = 1000; StartTime = (Get-Date).AddDays(-7) } 200 }
+        if ($null -eq $apps) { }
+        elseif ($apps.Count) {
             $top = $apps | ForEach-Object { if ($_.Properties.Count) { [string]$_.Properties[0].Value } } | Where-Object { $_ } | Group-Object | Sort-Object Count -Descending | Select-Object -First 6
             Add-Row $s 'Program crashes' ("$($apps.Count) this week: " + (($top | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', '))
         } else { Add-Row $s 'Program crashes' 'none this week' 'ok' }
@@ -358,6 +367,55 @@ param([string]$Json = '', [switch]$Yes)
             if (-not ($bad | Where-Object { @(22, 45, 47) -notcontains [int]$_.ConfigManagerErrorCode })) { Add-Row $s 'Devices' 'all working' 'ok' }
             if ($offDev) { Add-Row $s 'Disabled or unplugged' ("$($offDev.Count): " + (($offDev | Sort-Object -Unique) -join ', ')) }
         } catch { }
+    }
+
+    # ---- reliability (Reliability Monitor's data: Win32_ReliabilityStabilityMetrics and Win32_ReliabilityRecords) -------
+    # Windows scores the PC 1-10 every hour from its crashes and failures; the records are what pulled the score down.
+    # No administrator needed. Windows Server doesn't collect it unless it's turned on.
+    function Read-ReliabilityData {
+        try { $rel.Metrics = @(Get-CimInstance Win32_ReliabilityStabilityMetrics -ErrorAction Stop | Sort-Object TimeGenerated) } catch { }
+        try { $rel.Records = @(Get-CimInstance Win32_ReliabilityRecords -ErrorAction Stop | Where-Object { $_.TimeGenerated -gt (Get-Date).AddDays(-30) } | Sort-Object TimeGenerated -Descending) } catch { }
+    }
+    function Read-Reliability {
+        $s = New-Section 'Reliability'
+        if (-not $rel.Metrics -and -not $rel.Records) { Add-Row $s 'Reliability Monitor' 'no data (Windows is not collecting it on this PC)' 'warn'; return }
+        if ($rel.Metrics) {
+            $now = $rel.Metrics[-1]
+            $score = [math]::Round([double]$now.SystemStabilityIndex, 1)
+            $f = if ($score -lt 5) { 'bad' } elseif ($score -lt 7) { 'warn' } else { 'ok' }
+            if ($score -lt 7) { Add-Problem $(if ($score -lt 5) { 'bad' } else { 'warn' }) "Reliability Monitor scores this PC $score out of 10 (from its recent crashes and failures)." }
+            Add-Row $s 'Stability now' "$score out of 10" $f
+            # the lowest score of each of the last 30 days, for the page's chart
+            $days = $rel.Metrics | Where-Object { $_.TimeGenerated -gt (Get-Date).Date.AddDays(-29) } | Group-Object { $_.TimeGenerated.ToString('yyyy-MM-dd') } | Sort-Object Name
+            $points = @($days | ForEach-Object { , @($_.Name, [math]::Round(($_.Group | Measure-Object SystemStabilityIndex -Minimum).Minimum, 2)) })
+            if ($points.Count) {
+                $low = $points | Sort-Object { $_[1] } | Select-Object -First 1
+                Add-Row $s 'Lowest this month' "$([math]::Round($low[1], 1)) out of 10, on $($low[0])" $(if ($low[1] -lt 5) { 'warn' } else { '' })
+                $s.chart = [ordered]@{ title = 'Stability, lowest of each day (1 to 10)'; min = 1; max = 10; points = $points }
+            }
+        }
+        $kinds = [ordered]@{}
+        $changes = @{ installed = 0; removed = 0 }
+        foreach ($r in $rel.Records) {
+            $what = $null
+            switch ($r.SourceName) {
+                'Application Error' { $what = "stopped working: $($r.ProductName)" }
+                'Application Hang' { $what = "stopped responding: $($r.ProductName)" }
+                'EventLog' { if ($r.EventIdentifier -eq 6008) { $what = 'Windows shut down unexpectedly' } }
+                'Microsoft-Windows-WER-SystemErrorReporting' { $what = 'Windows stopped (blue screen)' }
+                'Windows Error Reporting' {
+                    if ("$($r.Message)" -match 'Event Name:\s*(BlueScreen|LiveKernelEvent)') { $what = $(if ($Matches[1] -eq 'BlueScreen') { 'Windows stopped (blue screen)' } else { 'Windows hardware or driver problem (LiveKernelEvent)' }) }
+                }
+                'MsiInstaller' { if ($r.EventIdentifier -eq 11707 -or $r.EventIdentifier -eq 1033) { $changes.installed++ } elseif ($r.EventIdentifier -eq 11724 -or $r.EventIdentifier -eq 1034) { $changes.removed++ } }
+            }
+            if (-not $what) { continue }
+            $kind = ($what -split ':')[0]
+            if (-not $kinds.Contains($kind)) { $kinds[$kind] = 0 }
+            $kinds[$kind]++
+            if ($s.lines.Count -lt 25) { $s.lines.Add($r.TimeGenerated.ToString('yyyy-MM-dd HH:mm') + "  $what") }
+        }
+        Add-Row $s 'Failures, 30 days' $(if ($kinds.Count) { ($kinds.Keys | ForEach-Object { "$($kinds[$_]) $_" }) -join ', ' } else { 'none' }) $(if ($kinds.Count) { '' } else { 'ok' })
+        if ($changes.installed -or $changes.removed) { Add-Row $s 'Programs changed, 30 days' "$($changes.installed) installed, $($changes.removed) removed" }
     }
 
     # ---- security ----------------------------------------------------------------------------------------------------
@@ -812,7 +870,7 @@ param([string]$Json = '', [switch]$Yes)
 
     Show-PdHeader -Name 'pxd Report' -Version "v$version"
     if (-not $Json) {
-        Say '  Collects a read-only report of this PC (hardware, drive and crash health, security, network, startup' 'Gray'
+        Say '  Collects a read-only report of this PC (hardware, drive, crash and reliability history, security, network, startup' 'Gray'
         Say '  items, programs and updates), encrypts it here and puts it on pxdtek.com for 48 hours behind a private' 'Gray'
         Say '  link. Only someone with the link can open it. Nothing on this PC is changed.' 'Gray'
         if (-not $isAdmin) { Say '  Not running as administrator: drive health, BitLocker, Secure Boot and TPM will be skipped.' 'DarkYellow' }
@@ -824,13 +882,13 @@ param([string]$Json = '', [switch]$Yes)
         }
     }
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    foreach ($step in @(@('This PC', ${function:Read-PC}), @('Health', ${function:Read-Health}), @('Security', ${function:Read-Security}), @('Network', ${function:Read-Network}), @('Programs and updates', ${function:Read-Software}))) {
+    foreach ($step in @(@('This PC', ${function:Read-PC}), @('Health and reliability', { Read-ReliabilityData; Read-Health; Read-Reliability }), @('Security', ${function:Read-Security}), @('Network', ${function:Read-Network}), @('Programs and updates', ${function:Read-Software}))) {
         Write-Host ('  ' + $step[0] + '...') -ForegroundColor DarkGray
         try { & $step[1] } catch { Add-Problem 'warn' "Part of the report failed ($($step[0])): $($_.Exception.Message)" }
     }
     # problems first: the bad ones, then the rest
     $report.problems = @($problems | Where-Object { $_.level -eq 'bad' }) + @($problems | Where-Object { $_.level -ne 'bad' })
-    $report.sections = @($sections | ForEach-Object { [ordered]@{ title = $_.title; rows = $_.rows.ToArray(); lines = $_.lines.ToArray(); note = $_.note } })
+    $report.sections = @($sections | ForEach-Object { [ordered]@{ title = $_.title; rows = $_.rows.ToArray(); lines = $_.lines.ToArray(); note = $_.note; chart = $_.chart } })
     $jsonText = $report | ConvertTo-Json -Depth 8 -Compress
     Write-Host ('  Done in {0:0} seconds.' -f $clock.Elapsed.TotalSeconds) -ForegroundColor DarkGray
     Write-Host ''
